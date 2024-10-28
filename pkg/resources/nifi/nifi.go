@@ -661,6 +661,12 @@ func (r *Reconciler) reconcileNifiPod(log zap.Logger, desiredPod *corev1.Pod) (e
 	}
 
 	if err == nil {
+		// k8s-objectmatcher options
+		opts := []patch.CalculateOption{
+			patch.IgnoreStatusFields(),
+			patch.IgnoreVolumeClaimTemplateTypeMetaAndStatus(),
+			patch.IgnorePDBSelector(),
+		}
 		// Since toleration does not support patchStrategy:"merge,retainKeys", we need to add all toleration from the current pod if the toleration is set in the CR
 		if len(desiredPod.Spec.Tolerations) > 0 {
 			desiredPod.Spec.Tolerations = append(desiredPod.Spec.Tolerations, currentPod.Spec.Tolerations...)
@@ -674,8 +680,65 @@ func (r *Reconciler) reconcileNifiPod(log zap.Logger, desiredPod *corev1.Pod) (e
 			}
 			desiredPod.Spec.Tolerations = uniqueTolerations
 		}
+		// If there are extra initContainers from webhook injections we need to add them
+		log.Debug("checking initcontainers",
+			zap.Int("Current Pod", len(currentPod.Spec.InitContainers)),
+			zap.Int("Desired Pod", len(desiredPod.Spec.InitContainers)))
+		if len(currentPod.Spec.InitContainers) > len(desiredPod.Spec.InitContainers) {
+			log.Debug("updating initcontainers")
+			desiredPod.Spec.InitContainers = append(currentPod.Spec.InitContainers, desiredPod.Spec.InitContainers...)
+			uniqueContainers := []corev1.Container{}
+			keys := make(map[string]bool)
+			for _, c := range desiredPod.Spec.InitContainers {
+				if _, value := keys[c.Name]; !value {
+					keys[c.Name] = true
+					uniqueContainers = append(uniqueContainers, c)
+				}
+			}
+			desiredPod.Spec.InitContainers = uniqueContainers
+		}
+		// If there are extra containers from webhook injections we need to add them
+		log.Debug("checking containers",
+			zap.Int("Current Pod", len(currentPod.Spec.Containers)),
+			zap.Int("Desired Pod", len(desiredPod.Spec.Containers)))
+		if len(currentPod.Spec.Containers) > len(desiredPod.Spec.Containers) {
+			log.Debug("updating containers")
+			desiredPod.Spec.Containers = append(currentPod.Spec.Containers, desiredPod.Spec.Containers...)
+			uniqueContainers := []corev1.Container{}
+			keys := make(map[string]bool)
+			for _, c := range desiredPod.Spec.Containers {
+				if _, value := keys[c.Name]; !value {
+					keys[c.Name] = true
+					uniqueContainers = append(uniqueContainers, c)
+				}
+			}
+			desiredPod.Spec.Containers = uniqueContainers
+		}
+		// Remove problematic fields if istio
+		log.Debug("Checking for istio annotation")
+		if _, ok := currentPod.Annotations["istio.io/rev"]; ok {
+			log.Debug("Found istio annotation")
+			// Prometheus scrape port is overridden by istio injection
+			delete(currentPod.Annotations, "prometheus.io/port")
+			delete(desiredPod.Annotations, "prometheus.io/port")
+			// Liveness probe port is overridden by istio injection
+			desiredContainer := corev1.Container{}
+			for _, c := range desiredPod.Spec.Containers {
+				if c.Name == "nifi" {
+					desiredContainer = c
+				}
+			}
+			currentContainers := []corev1.Container{}
+			for _, c := range currentPod.Spec.Containers {
+				if c.Name == "nifi" {
+					c.LivenessProbe = desiredContainer.LivenessProbe
+				}
+				currentContainers = append(currentContainers, c)
+			}
+			currentPod.Spec.Containers = currentContainers
+		}
 		// Check if the resource actually updated
-		patchResult, err := patch.DefaultPatchMaker.Calculate(currentPod, desiredPod)
+		patchResult, err := patch.DefaultPatchMaker.Calculate(currentPod, desiredPod, opts...)
 		if err != nil {
 			log.Error("could not match pod objects",
 				zap.String("clusterName", r.NifiCluster.Name),
@@ -697,7 +760,7 @@ func (r *Reconciler) reconcileNifiPod(log zap.Logger, desiredPod *corev1.Pod) (e
 
 				log.Debug("pod resource is in sync",
 					zap.String("clusterName", r.NifiCluster.Name),
-					zap.String("podName", desiredPod.Name))
+					zap.String("podName", currentPod.Name))
 
 				return nil, k8sutil.PodReady(currentPod)
 			}
